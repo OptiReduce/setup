@@ -1,3 +1,9 @@
+# Experimental Patch
+
+This branch contains an **experimental patch** that enables support for multiple PyTorch buckets. Please note that this version is **untested and unoptimized** and is intended **only for experimentation**.
+
+With this patch enabled, you no longer need to set DDP's `bucket_cap_mb` to a high value. 
+
 ## Prerequisites
 
 ### Network Interface Card (NIC) Requirements

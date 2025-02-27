@@ -1,0 +1,16 @@
+diff --git a/torch/csrc/distributed/c10d/init.cpp b/torch/csrc/distributed/c10d/init.cpp
+index 93f24e1e6a7..43718425ff4 100644
+--- a/torch/csrc/distributed/c10d/init.cpp
++++ b/torch/csrc/distributed/c10d/init.cpp
+@@ -2883,6 +2883,11 @@ options :class:`~torch.distributed.ProcessGroupNCCL.Options`).
+             options->timeout = timeout;
+             // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
+             options->threads = options->devices.size() * 2;
++            if (const char* env_algo = std::getenv("GLOO_ALGO")) {
++                if (std::string(env_algo) == "Optireduce") {
++                    options->threads = 1;
++                }
++            }
+             return c10::make_intrusive<::c10d::ProcessGroupGloo>(
+                 store, rank, size, options);
+           }),

@@ -62,8 +62,10 @@ optireduce:
 	cd $(INSTALL_DIR) && git clone https://github.com/pytorch/pytorch.git || (cd pytorch && git fetch)
 	cd $(INSTALL_DIR)/pytorch && git checkout $(PYTORCH_VERSION)
 	cd $(INSTALL_DIR)/pytorch && git submodule sync && git submodule update --init --recursive
-	cp patches/gloo.patch $(INSTALL_DIR)/pytorch/third_party/gloo/
-	cd $(INSTALL_DIR)/pytorch/third_party/gloo/ && git apply gloo.patch
+	cp patches/pytorch.patch $(INSTALL_DIR)/pytorch/
+	cp patches/gloo_experimental.patch $(INSTALL_DIR)/pytorch/third_party/gloo/
+	cd $(INSTALL_DIR)/pytorch/ && git apply pytorch.patch
+	cd $(INSTALL_DIR)/pytorch/third_party/gloo/ && git apply gloo_experimental.patch
 	cd $(INSTALL_DIR)/pytorch && source $(CONDA_DIR)/bin/activate optireduce && \
 		pip install -r requirements.txt && \
 		CUDACXX=/usr/local/cuda/bin/nvcc BUILD_BINARY=0 BUILD_TEST=0 python setup.py install

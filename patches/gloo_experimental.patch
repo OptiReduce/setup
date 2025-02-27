@@ -1,0 +1,1243 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b0db65e..cd31210 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,7 +117,7 @@ include_directories(${PROJECT_BINARY_DIR})
+ # Compiler flags
+
+ if(NOT MSVC)
+-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fPIC")
++  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fPIC -march=native")
+ endif()
+
+ # Recurse into main project directory
+diff --git a/gloo/CMakeLists.txt b/gloo/CMakeLists.txt
+index d5e6a1a..8935593 100644
+--- a/gloo/CMakeLists.txt
++++ b/gloo/CMakeLists.txt
+@@ -167,6 +167,11 @@ endif()
+
+ target_link_libraries(gloo PRIVATE ${gloo_DEPENDENCY_LIBS})
+
++# Link with DPDK libraries for OptiReduce
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(DPDK REQUIRED libdpdk)
++target_link_libraries(gloo PRIVATE ${DPDK_LIBRARIES})
++
+ # Add Interface include directories that are relocatable.
+ target_include_directories(gloo INTERFACE $<INSTALL_INTERFACE:include>)
+ if(USE_CUDA)
+diff --git a/gloo/allreduce.cc b/gloo/allreduce.cc
+index 1694dfa..49eab8f 100644
+--- a/gloo/allreduce.cc
++++ b/gloo/allreduce.cc
+@@ -37,6 +37,12 @@ void bcube(
+     ReduceRangeFunction reduceInputs,
+     BroadcastRangeFunction broadcastOutputs);
+
++// Forward declaration of transpose algorithm implementation.
++void transpose(
++    const detail::AllreduceOptionsImpl& opts,
++    ReduceRangeFunction reduceInputs,
++    BroadcastRangeFunction broadcastOutputs);
++
+ // Returns function that computes local reduction over inputs and
+ // stores it in the output for a given range in those buffers.
+ // This is done prior to either sending a region to a neighbor, or
+@@ -140,11 +146,217 @@ void allreduce(const detail::AllreduceOptionsImpl& opts) {
+     case detail::AllreduceOptionsImpl::BCUBE:
+       bcube(opts, reduceInputs, broadcastOutputs);
+       break;
++    case detail::AllreduceOptionsImpl::TRANSPOSE:
++      transpose(opts, reduceInputs, broadcastOutputs);
++      break;
+     default:
+       GLOO_ENFORCE(false, "Algorithm not handled.");
+   }
+ }
+
++void transpose(
++  const detail::AllreduceOptionsImpl& opts,
++  ReduceRangeFunction reduceInputs,
++  BroadcastRangeFunction broadcastOutputs) {
++  const auto& context = opts.context;
++  const std::vector<std::unique_ptr<transport::UnboundBuffer>>& out = opts.out;
++  const auto slot = Slot::build(kAllreduceSlotPrefix, opts.tag);
++  const size_t size_ = opts.elementSize;
++  const size_t count_ = opts.elements;
++  const size_t chunks_ = context->size;
++  const size_t rank_ = context->rank;
++  const size_t bytes_ = count_ * size_;
++  const size_t chunk_size_ = count_ / chunks_;
++  const size_t count_mod_chunks_ = count_ % chunks_;
++
++  static bool isFirstCall = true;
++
++  auto get_chunk_length = [&](size_t index) {
++    index =  index % chunks_;
++    if (index < count_mod_chunks_) {
++        return (chunk_size_ + 1);
++      } else {
++        return (chunk_size_);
++      }
++  };
++
++  auto get_chunk_offset = [&](size_t index) {
++    index =  index % chunks_;
++    if (index < count_mod_chunks_) {
++        return (chunk_size_ + 1) * index;
++      } else {
++        return (chunk_size_ * index + count_mod_chunks_);
++      }
++  };
++
++  uint64_t my_chunk_offset_ = get_chunk_offset(rank_) * size_;
++  uint64_t my_chunk_size_ = get_chunk_length(rank_) * size_;
++
++  // Allocate scratch space to receive data from peers.
++  std::unique_ptr<uint8_t[]> buffer(new uint8_t[my_chunk_size_*chunks_]);
++  std::unique_ptr<transport::UnboundBuffer> tmp =
++      context->createUnboundBuffer(buffer.get(), my_chunk_size_*chunks_);
++  bzero(tmp->ptr, my_chunk_size_*chunks_);
++
++  int j;
++
++  if (!isFirstCall && context->isUdp()) {
++    /* Make sure our turn before sending */
++    context->udpRecv(rank_, static_cast<uint8_t*>(tmp->ptr), my_chunk_size_ * (chunks_-1), opts.tag, false);
++
++    auto buffer1 = context->createUnboundBuffer(nullptr, 0);
++    const auto slot = Slot::build(kBarrierSlotPrefix, opts.tag);
++    for (size_t d = 1; d < context->size; d <<= 1) {
++        buffer1->recv((context->size + context->rank - d) % context->size, slot);
++        buffer1->send((context->size + context->rank + d) % context->size, slot);
++        buffer1->waitRecv(opts.timeout);
++        buffer1->waitSend(opts.timeout);
++    }
++
++    // send_chunk with rate_control
++    bool send_init = true;
++    int pending_sends = chunks_ - 1;
++    uint64_t send_arr[chunks_][5];
++    uint64_t remlen, sentlen, sendlen;
++    uint64_t max_buffer = 32000/chunks_;
++    while (pending_sends>0) {
++      for (int i = 1; i < chunks_; i++){
++        j = (rank_-i+chunks_)   %  chunks_ ;
++        if (send_init) {
++          send_arr[j][0] = get_chunk_offset(j) * size_;
++          send_arr[j][1] = 0;
++          send_arr[j][2] = get_chunk_length(j) * size_;
++          send_arr[j][3] = get_chunk_length(j) * size_;
++          send_arr[j][4] = get_chunk_length(j) * size_ * rank_;
++        }
++        remlen = send_arr[j][3];
++        if (remlen == 0)
++          continue;
++        sendlen = std::min(remlen, max_buffer);
++        context->udpSend(j, static_cast<uint8_t*>(out[0]->ptr) + send_arr[j][0], send_arr[j][1], send_arr[j][2],
++            sendlen, send_arr[j][4], opts.tag, false);
++        remlen -= sendlen;
++        send_arr[j][1] += sendlen;
++        send_arr[j][4] += sendlen;
++        send_arr[j][3] = remlen;
++        if (remlen == 0)
++          pending_sends--;
++      }
++      send_init = false;
++    }
++
++    context->waitUdpRecv(opts.tag, false);
++
++    // reduce_chunk
++    reduceInputs(my_chunk_offset_, my_chunk_size_);
++    for (int i = 0; i < chunks_; i++){
++      if (i==rank_)
++        continue;
++      opts.reduce(
++            static_cast<uint8_t*>(out[0]->ptr) + my_chunk_offset_,
++            static_cast<const uint8_t*>(out[0]->ptr) + my_chunk_offset_,
++            static_cast<const uint8_t*>(tmp->ptr) + my_chunk_size_ * i,
++            my_chunk_size_/size_);
++    }
++
++    broadcastOutputs(my_chunk_offset_, my_chunk_size_);
++
++    // receive_reduced
++    context->udpRecv(rank_, static_cast<uint8_t*>(out[0]->ptr), bytes_ - my_chunk_size_, opts.tag, true);
++
++    for (size_t d = 1; d < context->size; d <<= 1) {
++        buffer1->recv((context->size + context->rank - d) % context->size, slot);
++        buffer1->send((context->size + context->rank + d) % context->size, slot);
++        buffer1->waitRecv(opts.timeout);
++        buffer1->waitSend(opts.timeout);
++    }
++
++    // send reduced unicast with chunks round-robin
++    sentlen = 0;
++    remlen = my_chunk_size_;
++    max_buffer = 32000/chunks_;
++    while (remlen) {
++      sendlen = std::min(remlen, max_buffer);
++      for (int i = 1; i < chunks_; i++){
++        j = (rank_-i+chunks_)   %  chunks_ ;
++        context->udpSend(j, static_cast<uint8_t*>(out[0]->ptr) + my_chunk_offset_, sentlen,
++          my_chunk_size_, sendlen, my_chunk_offset_ + sentlen, opts.tag, true);
++      }
++      remlen -= sendlen;
++      sentlen += sendlen;
++    }
++
++    context->waitUdpRecv(opts.tag, true);
++
++    // local braodcast
++    for (int i = 1; i < chunks_; i++){
++      j = (rank_-i+chunks_)   %  chunks_ ;
++      broadcastOutputs(get_chunk_offset(j) * size_, get_chunk_length(j) * size_);
++    }
++  }
++
++  else {
++
++    // receive_chunk
++    for (int i = 1; i < chunks_; i++){
++      j = (rank_-i+chunks_)   %  chunks_ ;
++      tmp->recv(j, slot, my_chunk_size_ * (i-1), my_chunk_size_);
++    }
++
++    // send_chunk
++    for (int i = 1; i < chunks_; i++){
++      j = (rank_-i+chunks_)   %  chunks_ ;
++      reduceInputs(get_chunk_offset(j) * size_, get_chunk_length(j) * size_);
++      out[0]->send(j, slot, get_chunk_offset(j) * size_, get_chunk_length(j) * size_);
++    }
++
++    // wait for send/recv to complete
++    for (int i = 1; i < chunks_; i++){
++      tmp->waitRecv();
++      out[0]->waitSend();
++    }
++
++    reduceInputs(my_chunk_offset_, my_chunk_size_);
++
++    // reduce_chunk
++    for (int i = 0; i < chunks_ - 1; i++){
++      opts.reduce(
++            static_cast<uint8_t*>(out[0]->ptr) + my_chunk_offset_,
++            static_cast<const uint8_t*>(out[0]->ptr) + my_chunk_offset_,
++            static_cast<const uint8_t*>(tmp->ptr) + my_chunk_size_ * i,
++            my_chunk_size_/size_);
++    }
++
++    broadcastOutputs(my_chunk_offset_, my_chunk_size_);
++
++    // receive_reduced
++    for (int i = 1; i < chunks_; i++){
++      j = (rank_-i+chunks_)   %  chunks_ ;
++      out[0]->recv(j, slot, get_chunk_offset(j) * size_, get_chunk_length(j) * size_);
++    }
++
++    // send_reduced unicast to all
++    for (int i = 1; i < chunks_; i++){
++      j = (rank_-i+chunks_)   %  chunks_ ;
++      out[0]->send(j, slot, my_chunk_offset_, my_chunk_size_);
++    }
++
++    // wait for send/recv to complete
++    for (int i = 1; i < chunks_; i++){
++      out[0]->waitRecv();
++      out[0]->waitSend();
++    }
++
++    // local braodcast
++    for (int i = 1; i < chunks_; i++){
++      j = (rank_-i+chunks_)   %  chunks_ ;
++      broadcastOutputs(get_chunk_offset(j) * size_, get_chunk_length(j) * size_);
++    }
++
++    isFirstCall = false;
++  }
++}
++
+ void ring(
+     const detail::AllreduceOptionsImpl& opts,
+     ReduceRangeFunction reduceInputs,
+diff --git a/gloo/allreduce.h b/gloo/allreduce.h
+index 904eb8b..bcb1f8a 100644
+--- a/gloo/allreduce.h
++++ b/gloo/allreduce.h
+@@ -39,12 +39,13 @@ struct AllreduceOptionsImpl {
+     UNSPECIFIED = 0,
+     RING = 1,
+     BCUBE = 2,
++    TRANSPOSE = 3,
+   };
+
+   explicit AllreduceOptionsImpl(const std::shared_ptr<Context>& context)
+       : context(context),
+         timeout(context->getTimeout()),
+-        algorithm(UNSPECIFIED) {}
++        algorithm(Algorithm(context->getAlgorithm())) {}
+
+   std::shared_ptr<Context> context;
+
+diff --git a/gloo/context.cc b/gloo/context.cc
+index e6b5ea8..0622094 100644
+--- a/gloo/context.cc
++++ b/gloo/context.cc
+@@ -22,6 +22,7 @@ Context::Context(int rank, int size, int base)
+       size(size),
+       base(base),
+       slot_(0),
++      cachedAlgorithm_(-1),
+       timeout_(kTimeoutDefault) {
+   GLOO_ENFORCE_GE(rank, 0);
+   GLOO_ENFORCE_LT(rank, size);
+@@ -31,6 +32,47 @@ Context::Context(int rank, int size, int base)
+ Context::~Context() {
+ }
+
++int Context::getAlgorithm() const {
++  // Return cached value if already computed
++  if (cachedAlgorithm_ != -1) {
++    return cachedAlgorithm_;
++  }
++
++  // Compute and cache algorithm value
++  const char* algoName = getenv("GLOO_ALGO");
++  if (!algoName) {
++    cachedAlgorithm_ = 1;  // Default algorithm
++  } else if (strcmp(algoName, "Bcube") == 0) {
++    cachedAlgorithm_ = 2;
++  } else if (strcmp(algoName, "Transpose") == 0) {
++    cachedAlgorithm_ = 3;
++  } else if (strcmp(algoName, "Optireduce") == 0) {
++    isUdp_ = true;
++    cachedAlgorithm_ = 3;
++  } else {
++    cachedAlgorithm_ = 1;
++  }
++
++  return cachedAlgorithm_;
++}
++
++bool Context::isUdp() {
++  return isUdp_;
++}
++
++void Context::udpRecv(size_t rank, uint8_t* buffer, size_t length, uint16_t receive_counter, bool reduced) {
++  return transportContext_->udpRecv(rank, buffer, length, receive_counter, reduced);
++}
++
++void Context::waitUdpRecv(uint16_t receive_counter, bool reduced) {
++  return transportContext_->waitUdpRecv(receive_counter, reduced);
++}
++
++void Context::udpSend(size_t rank, uint8_t* buff, uint64_t offset, uint64_t end_offset, uint64_t chunk_length,
++                     uint64_t remote_offset, uint16_t send_counter, bool reduced) {
++  return transportContext_->udpSend(rank, buff, offset, end_offset, chunk_length, remote_offset, send_counter, reduced);
++}
++
+ std::shared_ptr<transport::Device>& Context::getDevice() {
+   GLOO_ENFORCE(device_, "Device not set!");
+   return device_;
+diff --git a/gloo/context.h b/gloo/context.h
+index da6933d..8762de0 100644
+--- a/gloo/context.h
++++ b/gloo/context.h
+@@ -11,6 +11,7 @@
+ #include <chrono>
+ #include <memory>
+ #include <vector>
++#include <cstring>
+
+ #include <gloo/transport/pair.h>
+
+@@ -50,9 +51,22 @@ class Context {
+
+   std::chrono::milliseconds getTimeout() const;
+
++  int getAlgorithm() const;
++
++  bool isUdp();
++
++  void udpRecv(size_t rank, uint8_t* buffer, size_t length, uint16_t receive_counter, bool reduced);
++
++  void waitUdpRecv(uint16_t receive_counter, bool reduced);
++
++  void udpSend(size_t rank, uint8_t* buff, uint64_t offset, uint64_t end_offset, uint64_t chunk_length,
++      uint64_t remote_offset, uint16_t send_counter, bool reduced);
++
+  protected:
+   std::shared_ptr<transport::Device> device_;
+   std::shared_ptr<transport::Context> transportContext_;
++  mutable int cachedAlgorithm_; // -1 means not yet computed
++  mutable bool isUdp_ = false;
+   int slot_;
+   std::chrono::milliseconds timeout_;
+ };
+diff --git a/gloo/transport/context.h b/gloo/transport/context.h
+index d5ede95..58de033 100644
+--- a/gloo/transport/context.h
++++ b/gloo/transport/context.h
+@@ -68,6 +68,13 @@ class Context {
+     return timeout_;
+   }
+
++  virtual void udpRecv(size_t rank, uint8_t* buffer, size_t length, uint16_t receive_counter, bool reduced) = 0;
++
++  virtual void waitUdpRecv(uint16_t receive_counter, bool reduced) = 0;
++
++  virtual void udpSend(size_t rank, uint8_t* buff, uint64_t offset, uint64_t end_offset,
++      uint64_t chunk_length, uint64_t remote_offset, uint16_t send_counter, bool reduced) = 0;
++
+  protected:
+   // Protects access to the pending operations and expected
+   // notifications vectors. These vectors can only be mutated by an
+diff --git a/gloo/transport/tcp/context.cc b/gloo/transport/tcp/context.cc
+index f1445b2..575179c 100644
+--- a/gloo/transport/tcp/context.cc
++++ b/gloo/transport/tcp/context.cc
+@@ -22,13 +22,22 @@ namespace transport {
+ namespace tcp {
+
+ Context::Context(std::shared_ptr<Device> device, int rank, int size)
+-    : ::gloo::transport::Context(rank, size), device_(std::move(device)) {}
++    : ::gloo::transport::Context(rank, size), device_(std::move(device)) {
++      const char* algoName = getenv("GLOO_ALGO");
++      if (algoName && strcmp(algoName, "Optireduce") == 0){
++        setupUdp(rank);
++      }
++    }
+
+ Context::~Context() {
+   // Pairs refer to device by raw pointer.
+   // Ensure they are destructed before the device.
+   pairs_.clear();
+   device_.reset();
++  if (isUdp_) {
++    print_stats();
++    closeUdp();
++  }
+ }
+
+ void Context::createAndConnectAllPairs(IStore &store) {
+@@ -106,6 +115,12 @@ void Context::createAndConnectAllPairs(IStore &store) {
+     auto remoteDeviceAddr = Address(remoteRankInfo.addressBytes).getSockaddr();
+     auto remoteAddr =
+         Address(remoteDeviceAddr, remoteRankInfo.pairIdentifiers[rank]);
++
++    // Extract IP and store mapping before connect
++    auto addrStr = remoteAddr.str();
++    auto ipaddr = addrStr.substr(0, addrStr.find("]")).erase(0,1);
++    setRankAddress(i, ipaddr);
++
+     pair->connect(remoteAddr.bytes());
+   }
+
+@@ -293,6 +308,222 @@ std::vector<char> Rank::bytes() const {
+   return buf;
+ }
+
++void Context::udpSend(size_t rank, uint8_t* buff, uint64_t offset, uint64_t end_offset,
++  uint64_t chunk_length, uint64_t remote_offset, uint16_t send_counter, bool reduced) {
++  int pkt_count = 0;
++  int burst_size, sent, retries;
++  uint16_t pkt_size, timeout;
++  uint32_t cfg_ip_dst;
++  struct rte_ether_addr cfg_ether_dst;
++  uint64_t remlen  = chunk_length;
++  uint8_t *curpos = buff + offset;
++  uint16_t sendlen = RTE_MIN(remlen, max_buffer);
++  uint16_t pkts_to_send = (remlen + sendlen - 1) / sendlen;
++  uint16_t pkts_num = pkts_to_send;
++
++  struct rte_mbuf *pkt;
++  struct rte_ult_hdr *ult_hdr;
++  struct rte_udp_hdr *udp_hdr;
++  struct rte_ipv4_hdr *ip_hdr;
++  struct rte_ether_hdr *eth_hdr;
++  struct rte_mbuf *pkts_burst[MAX_TX_BURST_SIZE];
++
++  // Calculate the send port and the receive struct for the current round
++  receive_struct* recv_struct = &recv_vectors[reduced ? 1 : 0];
++  uint16_t send_port = RECEIVE_PORT;
++
++  // Reduced traffic is sent to odd port numbers
++  if (reduced) {
++    send_port ++;
++  }
++
++  // Start the timer if not already started
++  if (recv_struct->first_recv)
++    startTimeout(recv_struct);
++
++  // Get the rank's ip and address, and the endtime for sending
++  std::chrono::system_clock::time_point send_endtime = recv_struct->step_endtime;
++  std::tie(cfg_ip_dst, cfg_ether_dst) = rank_to_addr_[rank];
++  timeout = recv_struct->tr_timeout_;
++
++  while (pkt_count < pkts_num && (!use_timer_ || std::chrono::high_resolution_clock::now() < send_endtime)) {
++    burst_size = RTE_MIN(pkts_to_send, MAX_TX_BURST_SIZE);
++    retries = 1;
++    while (rte_pktmbuf_alloc_bulk(send_mbuf_pool[0], pkts_burst, burst_size) != 0) {
++      rte_delay_us(10*retries++);
++    }
++    for (int i = 0; i < burst_size; i++) {
++      pkt = pkts_burst[i];
++      pkt_size = pkt_hdr_size + sendlen;
++      /* Initialize Ethernet header. */
++      eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
++      rte_ether_addr_copy(&cfg_ether_dst, &eth_hdr->d_addr);
++      rte_ether_addr_copy(&my_addr, &eth_hdr->s_addr);
++      eth_hdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
++      /* Initialize IP header. */
++      ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
++      memset(ip_hdr, 0, sizeof(*ip_hdr));
++      ip_hdr->version_ihl  = RTE_IPV4_VHL_DEF;
++      ip_hdr->type_of_service  = 0;
++      ip_hdr->fragment_offset  = 0;
++      ip_hdr->time_to_live = IP_DEFTTL;
++      ip_hdr->next_proto_id  = IPPROTO_UDP;
++      ip_hdr->packet_id  = 0;
++      ip_hdr->src_addr = rte_cpu_to_be_32(cfg_ip_src);
++      ip_hdr->dst_addr = rte_cpu_to_be_32(cfg_ip_dst);
++      ip_hdr->total_length = RTE_CPU_TO_BE_16(pkt_size - sizeof(*eth_hdr));
++      ip_hdr->hdr_checksum = ip_sum((const alias_int16_t *)ip_hdr, sizeof(*ip_hdr));
++      /* Initialize UDP header. */
++      udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
++      udp_hdr->src_port  = rte_cpu_to_be_16(send_port);
++      udp_hdr->dst_port  = rte_cpu_to_be_16(send_port);
++      udp_hdr->dgram_cksum = 0; /* Use UDP checksum for sync. */
++      udp_hdr->dgram_len = RTE_CPU_TO_BE_16(pkt_size - sizeof(*eth_hdr) - sizeof(*ip_hdr));
++      /* Initialize OptiReduce header. */
++      ult_hdr = (struct rte_ult_hdr *)(udp_hdr + 1);
++      ult_hdr->offset = remote_offset;
++      ult_hdr->counter = send_counter;
++      ult_hdr->timeout = timeout;
++      ult_hdr->length = sendlen;
++      ult_hdr->last = false;
++      if (offset/end_offset>0.99) {
++        ult_hdr->last = true;
++      }
++      ult_hdr->rank = my_rank_;
++      rte_memcpy((char*)(ult_hdr + 1), curpos, sendlen);
++      /* Pkt params. */
++      pkt->nb_segs   = 1;
++      pkt->pkt_len = pkt_size;
++      pkt->data_len = pkt_size;
++      pkt->l2_len    = sizeof(struct rte_ether_hdr);
++      pkt->l3_len    = sizeof(struct rte_ipv4_hdr);
++      pkt->next = NULL;
++      /* Update sentlen. */
++      curpos += sendlen;
++      offset += sendlen;
++      remote_offset += sendlen;
++      remlen -= sendlen;
++      sendlen = RTE_MIN(remlen, max_buffer);
++    }
++
++    // Send the burst and keep trying until all packets are sent
++    sent = 0;
++    retries = 0;
++    do {
++      sent += send_mbufs(pkts_burst + sent, burst_size - sent);
++      if (sent<burst_size) {
++        rte_delay_us(++retries*5);
++      }
++    } while (sent < burst_size );
++    pkts_to_send -= burst_size;
++    pkt_count += burst_size;
++  }
++}
++
++int Context::handleReceive() {
++  const uint16_t port = rx_pf_id;
++  struct rte_mbuf* mbufs[MAX_RX_BURST_SIZE];
++  int ring_id = rte_lcore_id() % NB_RX_RINGS;
++  bool reduced = (ring_id % 2) == 1;
++  receive_struct* recv_struct = &recv_vectors[reduced ? 1 : 0];
++  rte_atomic64_t* counter = reduced ? &sync_counter : &red_sync_counter;
++
++  uint64_t rank_to_bits_[chunks_ + 1];
++  for (uint16_t rank = 0; rank < chunks_ + 1; ++rank) {
++    rank_to_bits_[rank] = 1ULL << rank;
++  }
++
++  while(!force_quit) {
++    // Direct receive from NIC
++    const int nb_rx = rte_eth_rx_burst(port, ring_id, mbufs, MAX_RX_BURST_SIZE);
++
++    if (unlikely(nb_rx == 0)) {
++      if (recv_struct->readReady_ && recv_struct->pending_ranks_ == 0) {
++        rte_delay_us(10);
++        recv_struct->retry++;
++        if (recv_struct->retry > timeouts_[recv_struct->total_bytes_] * 10) {
++          recv_struct->readReady_ = false;
++          recv_struct->done_receive = true;
++          recv_struct->cv.notify_all();
++        }
++      }
++      continue;
++    }
++
++    recv_struct->retry = 0;
++
++    for (int j = 0; j < nb_rx; j++) {
++      struct rte_ult_hdr *ult_hdr = (struct rte_ult_hdr*)(
++        rte_pktmbuf_mtod(mbufs[j], char*) + ult_hdr_offset);
++
++      // Drop packet if old gradient data
++      if (unlikely(!recv_struct->readReady_ || recv_struct->counter != ult_hdr->counter)) {
++        rte_atomic64_add(counter, ult_hdr->length);
++        rte_pktmbuf_free(mbufs[j]);
++        continue;
++      }
++
++      // Copy data to buffer and update counters
++      rte_memcpy(recv_struct->buff + ult_hdr->offset,
++                (char*)ult_hdr + ult_hdr_size,
++                ult_hdr->length);
++      recv_struct->pending_bytes_ -= ult_hdr->length;
++
++      // Mark if one of 'last' packets received
++      if (unlikely(ult_hdr->last)) {
++        if (recv_struct->pending_ranks_ & rank_to_bits_[ult_hdr->rank]) {
++          recv_struct->pending_ranks_ ^= rank_to_bits_[ult_hdr->rank];  // Clear the bit
++          timeouts_arr_[recv_struct->total_bytes_][ult_hdr->rank] = ult_hdr->timeout;
++        }
++      }
++
++      // Signal if all packets received for this round
++      if (unlikely(recv_struct->pending_bytes_ == 0)) {
++        recv_struct->readReady_ = false;
++        recv_struct->done_receive = true;
++        recv_struct->cv.notify_all();
++      }
++
++      // Free the packet
++      rte_pktmbuf_free(mbufs[j]);
++    }
++  }
++  return 0;
++}
++
++void Context::waitUdpRecv(uint16_t receive_counter, bool reduced) {
++  // Get the receive/reduced struct for the current round
++  receive_struct* recv_struct = &recv_vectors[reduced ? 1 : 0];
++  uint64_t length = recv_struct->total_bytes_;
++  // Wait to receive all packets or till timeout
++  auto now = std::chrono::high_resolution_clock::now();
++  std::unique_lock<std::mutex> lck(recv_struct->mtx);
++  if (now < recv_struct->step_endtime) {
++    recv_struct->cv.wait_for(lck,
++      recv_struct->step_endtime - now,
++      [&]{ return recv_struct->done_receive; }
++    );
++  }
++  recv_struct->readReady_ = false;
++
++  // Update the timeout value
++  auto completion_ratio = 1 - static_cast<double>(recv_struct->pending_bytes_ / recv_struct->total_bytes_);
++  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++    std::chrono::high_resolution_clock::now() - recv_struct->step_timer).count();
++  recv_struct->tr_timeout_ = static_cast<uint16_t>(elapsed_ms/completion_ratio + 1);
++  timeouts_arr_[length][my_rank_] = recv_struct->tr_timeout_;
++  setTimeoutVal(length);
++
++  // Update the counters for printing stats at the end
++  if (!reduced) {
++    rte_atomic64_add(&recv_bytes, length);
++    rte_atomic64_add(&recv_loss_bytes, recv_struct->pending_bytes_);
++  } else {
++    rte_atomic64_add(&red_bytes, length);
++    rte_atomic64_add(&red_loss_bytes, recv_struct->pending_bytes_);
++  }
++}
++
+ } // namespace tcp
+ } // namespace transport
+ } // namespace gloo
+diff --git a/gloo/transport/tcp/context.h b/gloo/transport/tcp/context.h
+index 88cb6e8..3c1533c 100644
+--- a/gloo/transport/tcp/context.h
++++ b/gloo/transport/tcp/context.h
+@@ -19,6 +19,73 @@
+ #include "gloo/common/store.h"
+ #include "gloo/transport/context.h"
+
++#include <fstream>
++#include <iostream>
++#include <algorithm>
++#include <arpa/inet.h>
++#include <filesystem>
++#include <condition_variable>
++
++#include <rte_eal.h>
++#include <rte_common.h>
++#include <rte_malloc.h>
++#include <rte_mempool.h>
++#include <rte_mbuf.h>
++#include <rte_net.h>
++#include <rte_flow.h>
++#include <rte_cycles.h>
++#include <rte_port.h>
++#include <rte_malloc.h>
++#include <rte_memcpy.h>
++#include <rte_ether.h>
++#include <rte_ethdev.h>
++#include <rte_ip.h>
++#include <rte_udp.h>
++#include <rte_meter.h>
++#include <rte_cycles.h>
++#include <rte_lcore.h>
++
++#define RECEIVE_PORT 11000
++#define MAX_ITEMS_NUM (15)
++#define MAX_MAX_ACTION_NUM (5)
++#define NUM_MBUFS (131072)
++#define NUM_MBUFS_RES (262144)
++#define NUM_MBUFS_RES_RING (1048576)
++#define MBUF_CACHE_SIZE (250)
++#define NB_RX_RINGS (2)
++#define NB_TX_RINGS (1)
++#define RX_RING_SIZE (8192)
++#define TX_RING_SIZE (128)
++
++#define IP_DEFTTL 64 /* from RFC 1340. */
++/*
++ * Work-around of a compilation error with ICC on invocations of the
++ * rte_be_to_cpu_16() function.
++ */
++#ifdef __GCC__
++#define RTE_BE_TO_CPU_16(be_16_v)  rte_be_to_cpu_16((be_16_v))
++#define RTE_CPU_TO_BE_16(cpu_16_v) rte_cpu_to_be_16((cpu_16_v))
++#else
++#if RTE_BYTE_ORDER == RTE_BIG_ENDIAN
++#define RTE_BE_TO_CPU_16(be_16_v)  (be_16_v)
++#define RTE_CPU_TO_BE_16(cpu_16_v) (cpu_16_v)
++#else
++#define RTE_BE_TO_CPU_16(be_16_v) \
++ (uint16_t) ((((be_16_v) & 0xFF) << 8) | ((be_16_v) >> 8))
++#define RTE_CPU_TO_BE_16(cpu_16_v) \
++ (uint16_t) ((((cpu_16_v) & 0xFF) << 8) | ((cpu_16_v) >> 8))
++#endif
++#endif /* __GCC__ */
++
++/* Use this type to inform GCC that ip_sum violates aliasing rules. */
++typedef unaligned_uint16_t alias_int16_t __attribute__((__may_alias__));
++
++static const struct rte_eth_conf port_conf_default = {
++ .rxmode = {
++   .max_rx_pkt_len = RTE_ETHER_MAX_LEN * 5,
++ },
++};
++
+ namespace gloo {
+ namespace transport {
+ namespace tcp {
+@@ -91,6 +158,504 @@ class Context : public ::gloo::transport::Context,
+   friend class UnboundBuffer;
+
+   friend class Pair;
++
++  /* =========================== OptiReduce Logic ============================*/
++
++  typedef struct {
++    uint8_t* buff = nullptr;
++    bool readReady_ = false;
++    bool done_receive = false;
++    bool first_recv = true;
++    size_t retry;
++    uint16_t tr_timeout_;
++    uint16_t counter;
++    uint64_t total_bytes_;
++    uint64_t pending_bytes_;
++    uint64_t pending_ranks_;
++    std::chrono::system_clock::time_point step_timer;
++    std::chrono::system_clock::time_point step_endtime;
++    std::mutex mtx;
++    std::condition_variable cv;
++  } receive_struct;
++
++  struct rte_ult_hdr {
++    uint64_t offset;
++    uint16_t counter;
++    uint16_t timeout;
++    uint16_t length;
++    size_t rank;
++    bool last;
++  } __attribute__((__packed__));
++
++  uint32_t rx_pf_id;
++  uint32_t tx_pf_id;
++  std::string my_ip;
++  size_t my_rank_;
++  uint32_t cfg_ip_src;
++  struct rte_ether_addr my_addr;
++  receive_struct recv_vectors[NB_RX_RINGS];
++  struct rte_mempool* mbuf_pool[NB_RX_RINGS];
++  struct rte_mempool* send_mbuf_pool[NB_TX_RINGS];
++  std::unordered_map<size_t, uint16_t> timeouts_;
++  std::unordered_map<size_t, std::unique_ptr<uint16_t[]>> timeouts_arr_;
++  std::unordered_map<std::string, std::string> ip_to_addr_;
++  std::unordered_map<int, std::tuple<uint32_t, struct rte_ether_addr>> rank_to_addr_;
++
++  bool isUdp_ = false;
++  bool use_timer_ = false;
++  int mtu = 1500;
++  uint16_t chunks_ = 0;
++  uint16_t universal_timeout_ = 30000;
++  unsigned tr_threads_offset_ = 0;
++  uint64_t max_buffer = 1024;
++  uint16_t MAX_TX_BURST_SIZE = 32;
++  uint16_t MAX_RX_BURST_SIZE = 1024;
++  volatile bool force_quit = false;
++  const size_t ult_hdr_size = sizeof(struct rte_ult_hdr);
++  const size_t ult_hdr_offset = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
++  const size_t pkt_hdr_size = ult_hdr_offset + ult_hdr_size;
++
++  /* for printing receive and lost counters */
++  rte_atomic64_t recv_bytes;
++  rte_atomic64_t recv_loss_bytes;
++  rte_atomic64_t red_bytes;
++  rte_atomic64_t red_loss_bytes;
++  rte_atomic64_t sync_counter;
++  rte_atomic64_t red_sync_counter;
++
++  int handleReceive();
++
++  void waitUdpRecv(uint16_t receive_counter, bool reduced);
++
++  void udpSend(size_t rank, uint8_t* buff, uint64_t offset, uint64_t end_offset,
++    uint64_t chunk_length, uint64_t remote_offset, uint16_t send_counter, bool reduced);
++
++  void udpRecv(size_t rank, uint8_t* buffer, size_t length,
++      uint16_t receive_counter, bool reduced) {
++    // Get the receive/reduced struct for the current round
++    receive_struct* recv_struct = &recv_vectors[reduced ? 1 : 0];
++    // Create a timeouts entry for this length if not already present
++    if (timeouts_arr_.find(length) == timeouts_arr_.end()) {
++      timeouts_[length] = universal_timeout_;
++      timeouts_arr_[length] = std::make_unique<uint16_t[]>(chunks_ + 1);
++    }
++    recv_struct->buff = buffer;
++    recv_struct->retry = 0;
++    recv_struct->first_recv = true;
++    recv_struct->done_receive = false;
++    recv_struct->total_bytes_ = length;
++    recv_struct->pending_bytes_ = length;
++    recv_struct->counter = receive_counter;
++    recv_struct->pending_ranks_ = (1ULL << (chunks_ + 1)) - 1;
++    recv_struct->pending_ranks_ &= ~(1ULL << my_rank_);
++    recv_struct->readReady_ = true;
++  }
++
++  uint16_t getMedian(uint16_t arr[]) {
++    int mid = (chunks_ + 1) / 2;
++    std::sort(arr, arr + chunks_ + 1);
++    return (chunks_ + 1) % 2 ? arr[mid] : (arr[mid] + arr[mid - 1]) / 2;
++  }
++
++  void setTimeoutVal(size_t length) {
++    timeouts_[length] = std::min(
++      getMedian(timeouts_arr_[length].get()),
++      universal_timeout_
++    );
++  }
++
++  void startTimeout(receive_struct *recv_struct) {
++    recv_struct->first_recv = false;
++    recv_struct->step_timer = std::chrono::high_resolution_clock::now();
++    recv_struct->step_endtime = recv_struct->step_timer +
++      std::chrono::milliseconds(universal_timeout_);
++  }
++
++  void setRankAddress(int rank, std::string ip) {
++    uint32_t intIP;
++    struct rte_ether_addr mac_addr;
++    ip_string_to_number(ip.c_str(), &intIP);
++    rte_ether_unformat_addr(ip_to_addr_[ip].c_str(), &mac_addr);
++    rank_to_addr_[rank] = std::make_tuple(intIP, mac_addr);
++    chunks_++;
++  }
++
++  int ip_string_to_number(const char *ip_str, uint32_t *int_ip) {
++    unsigned int byte3, byte2, byte1, byte0;
++    sscanf(ip_str, "%u.%u.%u.%u", &byte3, &byte2, &byte1, &byte0);
++    if ((byte3 < 256) && (byte2 < 256) && (byte1 < 256) &&
++        (byte0 < 256)) {
++      *int_ip = (byte3 << 24) + (byte2 << 16) + (byte1 << 8) + byte0;
++      return 0;
++    }
++    return 1;
++   }
++
++  uint16_t ip_sum(const alias_int16_t *hdr, int hdr_len) {
++    uint32_t sum = 0;
++    while (hdr_len > 1) {
++      sum += *hdr++;
++      if (sum & 0x80000000)
++        sum = (sum & 0xFFFF) + (sum >> 16);
++      hdr_len -= 2;
++    }
++    while (sum >> 16)
++      sum = (sum & 0xFFFF) + (sum >> 16);
++    return ~sum;
++  }
++
++  uint16_t send_mbufs(struct rte_mbuf **mbufs, uint16_t nb) {
++    uint16_t ret;
++    int queue_id = 0;
++    ret = rte_eth_tx_prepare(tx_pf_id, queue_id, mbufs, nb);
++    if (ret == 0)
++      return ret;
++    return rte_eth_tx_burst(tx_pf_id, queue_id, mbufs, ret);
++  }
++
++  void create_mbuf_pools() {
++    int mbuf_size = (mtu + RTE_PKTMBUF_HEADROOM > RTE_MBUF_DEFAULT_BUF_SIZE ?
++      mtu + RTE_PKTMBUF_HEADROOM : RTE_MBUF_DEFAULT_BUF_SIZE);
++    for (int i=0; i<NB_RX_RINGS; i++) {
++      std::string pool_name("mbuf_pool" + std::to_string(i));
++      mbuf_pool[i] = rte_pktmbuf_pool_create(pool_name.c_str(), NUM_MBUFS,
++                  MBUF_CACHE_SIZE, 0,
++                  mbuf_size,
++                  rte_socket_id());
++      if (mbuf_pool[i] == NULL)
++        rte_exit(EXIT_FAILURE, "Cannot init mbuf pool %d\n", i);
++    }
++    for (int i=0; i<NB_TX_RINGS; i++) {
++      std::string pool_name("send_mbuf_pool" + std::to_string(i));
++      send_mbuf_pool[i] = rte_pktmbuf_pool_create(pool_name.c_str(),
++                  MAX_TX_BURST_SIZE * 64,
++                  MBUF_CACHE_SIZE, 0,
++                  mbuf_size,
++                  rte_socket_id());
++      if (send_mbuf_pool[i] == NULL)
++        rte_exit(EXIT_FAILURE, "Cannot init mbuf pool %d\n", i);
++    }
++  }
++
++  void create_flow(int port, struct rte_flow_attr* attr, struct rte_flow_item* items,
++         struct rte_flow_action *actions) {
++    struct rte_flow_error error;
++    struct rte_flow *flow = NULL;
++    int res = 0;
++    res = rte_flow_validate(port, attr, items, actions, &error);
++    if (!res) {
++        flow = rte_flow_create(port, attr, items, actions, &error);
++    }
++    if (!flow) {
++        rte_exit(EXIT_FAILURE, "error in creating tx flow\n");
++    }
++  }
++
++  void create_rx_hw_tables() {
++    struct rte_flow_item_port_id port_id_mask = {.id = 0xffffffff};
++    struct rte_flow_item_port_id port_id_spec = {.id = rx_pf_id};
++    struct rte_flow_action actions[MAX_MAX_ACTION_NUM];
++    struct rte_flow_item items[MAX_ITEMS_NUM];
++    uint32_t priority = 0;
++    struct rte_flow_attr attr = {
++      .group = 0,
++      .priority = priority,
++      .ingress = 1,
++      .transfer = 0,
++    };
++
++    int port_to_create_rte_flow = rx_pf_id;
++    int action = 0;
++    int item = 0;
++    struct rte_flow_action_count count_action = {.shared = 0};
++    struct rte_flow_action_port_id action_port_id;
++    struct rte_flow_item_udp udp_spec;
++    struct rte_flow_item_udp udp_mask;
++    memset(&udp_spec, 0, sizeof(udp_spec));
++    memset(&udp_mask, 0, sizeof(udp_mask));
++
++    int q_idx = 0;
++    for (int i = 0; i < NB_RX_RINGS; i++) {
++      item = 0;
++      action = 0;
++      memset(items, 0, sizeof(items));
++      memset(actions, 0, sizeof(actions));
++      items[item].type = RTE_FLOW_ITEM_TYPE_ETH;
++      item++;
++      items[item].type = RTE_FLOW_ITEM_TYPE_IPV4;
++      item++;
++      udp_spec.hdr.src_port = htons(RECEIVE_PORT + i);
++      udp_mask.hdr.src_port = htons(0xffff);
++      items[item].type = RTE_FLOW_ITEM_TYPE_UDP;
++      items[item].spec = &udp_spec;
++      items[item].mask = &udp_mask;
++      item++;
++      items[item].type = RTE_FLOW_ITEM_TYPE_END;
++      actions[action].type = RTE_FLOW_ACTION_TYPE_QUEUE;
++      struct rte_flow_action_queue action_queue;
++      action_queue.index = q_idx + i;
++      actions[action].conf = &action_queue;
++      action++;
++      actions[action].type = RTE_FLOW_ACTION_TYPE_END;
++      create_flow(port_to_create_rte_flow, &attr, items, actions);
++    }
++  }
++
++  #define CHECK_INTERVAL 1000 /* 100ms */
++  #define MAX_REPEAT_TIMES 90 /* 9s (90 * 100ms) in total */
++
++  static void assert_link_status(uint16_t port_id) {
++    uint8_t rep_cnt = MAX_REPEAT_TIMES;
++    int link_get_err = -EINVAL;
++    struct rte_eth_link link;
++    memset(&link, 0, sizeof(link));
++    do {
++      link_get_err = rte_eth_link_get(port_id, &link);
++      if (link_get_err == 0 && link.link_status == ETH_LINK_UP)
++        break;
++      rte_delay_ms(CHECK_INTERVAL);
++    } while (--rep_cnt);
++
++    if (link_get_err < 0)
++      rte_exit(EXIT_FAILURE, ":: error: link get is failing: %s\n",
++        rte_strerror(-link_get_err));
++    if (link.link_status == ETH_LINK_DOWN)
++      rte_exit(EXIT_FAILURE, ":: error: link is still down\n");
++  }
++
++  void port_init(uint16_t port_id=0) {
++    const uint16_t rx_rings = NB_RX_RINGS, tx_rings = NB_TX_RINGS;
++    struct rte_eth_conf port_conf = port_conf_default;
++    struct rte_eth_dev_info dev_info;
++    uint16_t nb_rxd = RX_RING_SIZE;
++    uint16_t nb_txd = TX_RING_SIZE;
++    struct rte_eth_txconf txconf;
++    struct rte_ether_addr addr;
++    int ret;
++
++    ret = rte_eth_dev_info_get(port_id, &dev_info);
++    if (ret != 0)
++      rte_exit(EXIT_FAILURE,
++        "Error during getting device (port %u) info: %s\n",
++        port_id, strerror(-ret));
++    // use the same port for send and receive
++    rx_pf_id = port_id;
++    tx_pf_id = port_id;
++    port_conf.txmode.offloads &= dev_info.tx_offload_capa;
++    ret = rte_eth_dev_configure(port_id,
++           rx_rings,
++           tx_rings,
++           &port_conf);
++    if (ret < 0) {
++      rte_exit(EXIT_FAILURE,
++        ":: cannot configure device: err=%d, port=%u\n", ret,
++        port_id);
++    }
++
++    ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &nb_rxd, &nb_txd);
++    if (ret != 0)
++      rte_exit(EXIT_FAILURE,
++        "rte_eth_dev_adjust_nb_rx_tx_desc: err=%d, port=%u\n",
++        ret, port_id);
++    for (uint16_t q = 0; q < rx_rings; q++) {
++      ret = rte_eth_rx_queue_setup(port_id, q, nb_rxd,
++                rte_eth_dev_socket_id(port_id),
++                NULL, mbuf_pool[q]);
++      if (ret < 0) {
++        rte_exit(EXIT_FAILURE,
++          ":: Rx queue setup failed: err=%d, port=%u\n",
++          ret, port_id);
++      }
++    }
++
++    txconf = dev_info.default_txconf;
++    txconf.offloads = port_conf.txmode.offloads;
++    for (uint16_t q = 0; q < tx_rings; q++) {
++      ret = rte_eth_tx_queue_setup(port_id, q, nb_txd,
++                rte_eth_dev_socket_id(port_id),
++                &txconf);
++      if (ret < 0) {
++        rte_exit(EXIT_FAILURE,
++          ":: Tx queue setup failed: err=%d, port=%u\n",
++          ret, port_id);
++      }
++    }
++
++    struct rte_flow_error err;
++    ret = rte_flow_isolate(port_id, 1, &err);
++    if (ret < 0) {
++      rte_exit(EXIT_FAILURE, "rte_flow_isolate: err=%d port=%u\n",
++          ret, port_id);
++    }
++    ret = rte_eth_dev_start(port_id);
++    if (ret < 0) {
++      rte_exit(EXIT_FAILURE, "rte_eth_dev_start:err=%d, port=%u\n",
++        ret, port_id);
++    }
++    /* Display the port MAC address. */
++    ret = rte_eth_macaddr_get(port_id, &my_addr);
++    if (ret != 0) {
++      rte_exit(EXIT_FAILURE,
++        "rte_eth_macaddr_get failed :err=%d, port=%u\n", ret,
++        port_id);
++    }
++    assert_link_status(port_id);
++    return;
++  }
++
++  int port_close(uint16_t port_id=0) {
++    struct rte_flow_error error;
++    int ret;
++    /* closing and releasing resources */
++    rte_flow_flush(port_id, &error);
++    ret = rte_eth_dev_stop(port_id);
++    if (ret < 0)
++      printf("Failed to stop port %u: %s", port_id,
++            rte_strerror(-ret));
++    rte_eth_dev_close(port_id);
++    return ret;
++  }
++
++  void populate_ip_to_addr(const std::string& filepath) {
++    char own_addr[RTE_ETHER_ADDR_FMT_SIZE];
++    rte_ether_format_addr(own_addr, RTE_ETHER_ADDR_FMT_SIZE, &my_addr);
++    const std::string delimiter = "=";
++    std::ifstream MyReadFile(filepath);
++    if (!MyReadFile.is_open()) {
++      rte_exit(EXIT_FAILURE, "File does not exist at path: %s. Please ensure the dpdk.cfg file exists.\n", filepath.c_str());
++    }
++    std::string line;
++    while (getline(MyReadFile, line)) {
++      size_t pos = line.find(delimiter);
++      if (pos == std::string::npos) {
++        continue;  // Skip invalid lines without delimiter
++      }
++      std::string ip = line.substr(0, pos);
++      std::string addr = line.substr(pos + delimiter.length());
++      if (strcmp(own_addr, addr.c_str()) == 0) {
++        my_ip = ip;
++      }
++      ip_to_addr_[ip] = addr;
++    }
++    MyReadFile.close();
++    if (!my_ip.empty()) {
++      ip_string_to_number(my_ip.c_str(), &cfg_ip_src);
++    } else {
++      rte_exit(EXIT_FAILURE, "Failed to determine my IP address from the config file.\n");
++    }
++  }
++
++  std::string get_pci_address(const std::string& interface) {
++    std::filesystem::path sysfs_path{"/sys/class/net/" + interface + "/device"};
++    return std::filesystem::read_symlink(sysfs_path).filename();
++  }
++
++  int eal_init(char* dpdk_pci, std::string rank, std::string cores) {
++    int argc = 8;
++    char a[] = "dpdk";
++    char b[] = "-a";
++    char d[] = ",txq_mpw_en=0,txq_inline=0,dv_esw_en=1,dv_flow_en=1";
++    char e[] = "--file-prefix";
++    char *f = &rank[0];
++    char g[] = "-l";
++    char *h = &cores[0];
++    char *argv[] = {a, b, dpdk_pci, d, e, f, g, h};
++    return rte_eal_init(argc, argv);
++  }
++
++  int dpdk_init(int rank) {
++    int ret;
++    my_rank_ = rank;
++    std::string dpdk_cfg = "dpdk.cfg";
++
++    char* timeoutEnv = getenv("GLOO_DPDK_TIMEOUT");
++    if (timeoutEnv && strlen(timeoutEnv)>0)
++      universal_timeout_ = std::stoi(timeoutEnv);
++
++    char* threadoffEnv = getenv("GLOO_DPDK_THREADS_OFFSET");
++    if (threadoffEnv && strlen(threadoffEnv)>0)
++      tr_threads_offset_ = std::stoi(threadoffEnv);
++
++    char* sendtimerEnv = getenv("GLOO_DPDK_SEND_TIMER");
++    if (sendtimerEnv && strlen(sendtimerEnv)>0)
++      use_timer_ = true;
++
++    char* dpdkCfg = getenv("GLOO_DPDK_CONFIG");
++    if (dpdkCfg && strlen(dpdkCfg)>0)
++      dpdk_cfg = dpdkCfg;
++
++    char* ifnameEnv = getenv("GLOO_SOCKET_IFNAME");
++    if (!ifnameEnv || strlen(ifnameEnv) < 2)
++      rte_exit(EXIT_FAILURE, "Missing GLOO_SOCKET_IFNAME env\n");
++    std::string dpdk_pci = get_pci_address(ifnameEnv);
++
++    ret = eal_init(const_cast<char*>(dpdk_pci.c_str()), std::to_string(rank),
++            std::string(std::to_string(tr_threads_offset_) + "-" +
++                std::to_string(tr_threads_offset_ + NB_RX_RINGS)));
++    if (ret < 0)
++      rte_exit(EXIT_FAILURE, ":: EAL initialization failed\n");
++
++    create_mbuf_pools();
++    port_init();
++    create_rx_hw_tables();
++    populate_ip_to_addr(dpdk_cfg);
++    rte_atomic64_init(&recv_bytes);
++    rte_atomic64_init(&recv_loss_bytes);
++    rte_atomic64_init(&red_bytes);
++    rte_atomic64_init(&red_loss_bytes);
++    rte_atomic64_init(&sync_counter);
++    rte_atomic64_init(&red_sync_counter);
++    return 0;
++  }
++
++  static int handleReceiveThreadWrapper(void* arg) {
++    gloo::transport::tcp::Context* ctx =
++      reinterpret_cast<gloo::transport::tcp::Context*>(arg);
++    return ctx->handleReceive();
++  }
++
++  void setupUdp(int rank) {
++    uint32_t lcore;
++    isUdp_ = true;
++    std::cout<<"Going to init dpdk"<<std::endl;
++    dpdk_init(rank);
++    RTE_LCORE_FOREACH_WORKER(lcore) {
++      rte_eal_remote_launch(handleReceiveThreadWrapper, this, lcore);
++    }
++    std::cout<<"Dpdk init done"<<std::endl;
++  }
++
++  void closeUdp() {
++    force_quit = true;
++    uint32_t lcore;
++    RTE_LCORE_FOREACH_WORKER(lcore) {
++     rte_eal_wait_lcore(lcore);
++    }
++    port_close();
++    rte_eal_cleanup();
++  }
++
++  void print_stats() {
++    std::ostringstream a;
++    a << "Expected: ";
++    a << "\n|-Receive Bytes: " << rte_atomic64_read(&recv_bytes);
++    a << "\n|-Reduced Bytes: " << rte_atomic64_read(&red_bytes) << std::endl;
++    a << "Out-of-sync: ";
++    a << "\n|-Receive Bytes: " << rte_atomic64_read(&sync_counter);
++    a << "\n|-Reduced Bytes: " << rte_atomic64_read(&red_sync_counter) << std::endl;
++    a << "Total lost: ";
++    a << "\n|-Receive Bytes: " << rte_atomic64_read(&recv_loss_bytes);
++    a << "\n|-Reduced Bytes: " << rte_atomic64_read(&red_loss_bytes) << std::endl;
++    std::string b = a.str();
++    std::cout<<b;
++    char* fileEnv = getenv("GLOO_DPDK_FILE_PREFIX");
++    if (fileEnv && strlen(fileEnv)>0) {
++      std::string filename(std::string(fileEnv) + "_out.log");
++      std::ofstream MyFile(filename);
++      MyFile << b;
++      MyFile.close();
++    }
++  }
+ };
+
+ struct Rank {
