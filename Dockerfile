@@ -47,7 +47,7 @@ RUN git clone https://github.com/DPDK/dpdk.git && \
     git checkout v20.11 && \
     meson build --prefix=/usr/local -Dexamples=all -Ddrivers=net/mlx5 && \
     ninja -C build && ninja -C build install && \
-    ldconfig
+    ldconfig && \
     echo 'export LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> ~/.bashrc
 
 # Clone OptiReduce and patch Gloo
