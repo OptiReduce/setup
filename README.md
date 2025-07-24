@@ -83,6 +83,16 @@ make hadamard    # Install Hadamard CUDA only
 
 Use `make help` to see all available installation options.
 
+
+## Building Torchvision from source
+
+We build a custom PyTorch and hence need to build Torchvision from source to work with it.
+```bash
+git clone https://github.com/pytorch/vision.git
+cd vision
+python setup.py install
+```
+
 ## Directory Structure
 
 ```
