@@ -22,6 +22,9 @@ RUN apt-get update -qq && apt-get install -yq \
     pkg-config \
     libpcap-dev \
     git \
+    screen \
+    nano \
+    net-tools \
     software-properties-common \
     linux-headers-$(uname -r)
 
@@ -65,14 +68,16 @@ RUN pip install -r requirements.txt && \
     pip install cmake==3.25.0 && \
     pip install transformers==4.53.1 && \
     pip install pillow pandas tqdm && \ 
+    pip install --no-deps torchvision && \ 
     echo 'export PYTHONPATH=/usr/lib/python3.9/site-packages:$PYTHONPATH' >> ~/.bashrc
 #    CUDACXX=/usr/local/cuda/bin/nvcc BUILD_BINARY=0 BUILD_TEST=0 python3 setup.py install
 
 # Build and install torchvision
-WORKDIR /usr/src
-RUN git clone https://github.com/pytorch/vision.git
+#WORKDIR /usr/src
+#RUN git clone https://github.com/pytorch/vision.git
 #    cd vision && \
 #    CUDACXX=/usr/local/cuda/bin/nvcc python3 setup.py install
+
 
 # Build and install benchmark
 WORKDIR /root
