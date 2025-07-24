@@ -68,7 +68,6 @@ RUN pip install -r requirements.txt && \
     pip install cmake==3.25.0 && \
     pip install transformers==4.53.1 && \
     pip install pillow pandas tqdm && \ 
-    pip install --no-deps torchvision && \ 
     echo 'export PYTHONPATH=/usr/lib/python3.9/site-packages:$PYTHONPATH' >> ~/.bashrc
 #    CUDACXX=/usr/local/cuda/bin/nvcc BUILD_BINARY=0 BUILD_TEST=0 python3 setup.py install
 
