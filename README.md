@@ -26,6 +26,23 @@ You can use the included `Dockerfile` to setup and run the benchmarks directly. 
 git clone https://github.com/OptiReduce/setup.git
 cd setup
 sudo docker build -t optireduce:latest .
+sudo docker run -it \
+  --name optireduce \
+  --gpus all \
+  --privileged \
+  --network=host \
+  --cap-add=ALL \
+  --ipc=host \
+  --shm-size=1g \
+  -v /dev:/dev \
+  -v /mnt:/mnt \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  --ulimit memlock=-1:-1 \
+  --ulimit stack=67108864 \
+  optireduce:latest \
+  bash
+
 sudo docker run -it --privileged \
   --gpus all \
   --network=host \
