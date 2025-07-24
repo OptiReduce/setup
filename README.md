@@ -43,15 +43,6 @@ sudo docker run -it \
   optireduce:latest \
   bash
 
-sudo docker run -it --privileged \
-  --gpus all \
-  --network=host \
-  --cap-add=ALL \
-  -v /dev:/dev \
-  -v /mnt:/mnt \
-  --name=optireduce
-  optireduce:latest \
-  bash
 ```
 
 - Note: The first time initialization will take some time for installing libraries and OptiReduce.
