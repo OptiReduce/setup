@@ -94,8 +94,7 @@ if [ ! -d /usr/lib/python3.9/site-packages/torch ]; then\n\
   echo "One-time OptiReduce & Torchvision install..."\n\
   cd /usr/src/pytorch && CUDACXX=/usr/local/cuda/bin/nvcc BUILD_BINARY=0 BUILD_TEST=0 python3 setup.py install\n\
   /usr/src/dpdk/usertools/dpdk-hugepages.py -p 2M --setup 16G\n\
-  apt purge ucx-cuda\n\
-  apt purge libnvidia-decode-575\n\
+  apt purge -y ucx-cuda && cd\n\ 
 fi\n\
 exec "$@"' > /entrypoint.sh && chmod +x /entrypoint.sh
 
